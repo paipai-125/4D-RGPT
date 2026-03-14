@@ -117,6 +117,7 @@ Checkpoints are saved in `4D-Data/checkpoints_distill/`.
 Run the base model inference:
 
 ```bash
+pip install nltk rouge tqdm
 torchrun --nproc_per_node=8 base_test.py
 ```
 
