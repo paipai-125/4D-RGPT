@@ -110,9 +110,6 @@ def calculate_metrics(gt_answers, pred_answers):
     return avg_bleu, avg_rouge
 
 def main():
-    # ==========================
-    # DDP Initialization / 多卡初始化
-    # ==========================
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
