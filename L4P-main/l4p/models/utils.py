@@ -18,6 +18,7 @@ def prepare_model(
     max_queries: Optional[int] = None,
     precision: str = "16-mixed",
     accelerator: str = "gpu",
+    devices: int | list = 1, # Added devices argument
 ):
     """
     Loads pytorch lightning model using model config file and checkpoint file.
@@ -29,6 +30,7 @@ def prepare_model(
         max_queries (Optional[int], optional): Maximum number of queries. Defaults to None.
         precision (str, optional): Precision. Defaults to "16-mixed".
         accelerator (str, optional): Accelerator. Defaults to "gpu".
+        devices (int | list, optional): Devices to use. Defaults to 1.
 
     Returns:
         _type_: Returns pytorch lightning model.
@@ -54,7 +56,7 @@ def prepare_model(
     model = model.eval()
 
     # convert to appropriate type
-    fabric = Fabric(precision=precision, accelerator=accelerator)  # type: ignore
+    fabric = Fabric(precision=precision, accelerator=accelerator, devices=devices)  # type: ignore
     model = fabric.setup(model)
 
     return model

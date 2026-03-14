@@ -25,19 +25,32 @@ class TeacherWrapper(nn.Module):
     """
     def __init__(self, 
                  config_path="L4P-main/configs/model.yaml", 
-                 ckpt_path="L4P-main/weights/l4p_depth_flow_2d3dtrack_camray_dynseg_v1.ckpt",
+                 ckpt_path="../4D-Data/l4p-weights/l4p_depth_flow_2d3dtrack_camray_dynseg_v1.ckpt",
                  device="cuda"):
         super().__init__()
         self.device = device
         
+        # 优化: 获取设备索引，精准分配，避免所有进程都加载到 GPU0
+        device_idx = [0] # 默认
+        if isinstance(device, torch.device) and device.index is not None:
+             device_idx = [device.index]
+        elif isinstance(device, str) and ":" in device:
+             try:
+                 device_idx = [int(device.split(":")[-1])]
+             except:
+                 pass
+        elif isinstance(device, int):
+             device_idx = [device]
+
         # 加载 L4P 模型
-        print(f"[TeacherWrapper] Loading L4P model from {ckpt_path}...")
+        print(f"[TeacherWrapper] Loading L4P model from {ckpt_path} on device {device_idx}...")
         self.model = prepare_model(
             model_config_path=config_path,
             ckpt_path=ckpt_path,
             max_queries=64,
-            precision="16-mixed", # 或者 "32"
-            accelerator="gpu" if device=="cuda" else "cpu"
+            precision="32", # 改为 "32" 以避免 distributed 模式下的 BF16/FP32 冲突
+            accelerator="gpu" if device != "cpu" else "cpu",
+            devices=device_idx # 显式传入设备列表
         )
         self.model.to(device)
         self.model.eval()
@@ -82,9 +95,13 @@ class TeacherWrapper(nn.Module):
             
         # Stack Batch -> (B, 3, T, H, W)
         batch_tensors = torch.stack(batch_tensors, dim=0).to(self.device)
-        
-        # Normalize
-        batch_tensors = (batch_tensors - self.mean) / self.std
+
+        # Normalize with float32
+        batch_tensors = (batch_tensors - self.mean.to(batch_tensors.dtype)) / self.std.to(batch_tensors.dtype)
+
+        # Force conversion to float32 for model input (avoid BF16/FP32 mixture)
+        batch_tensors = batch_tensors.to(torch.float32)
+
         return batch_tensors
 
     @torch.no_grad()

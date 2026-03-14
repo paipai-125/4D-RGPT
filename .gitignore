@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# tmp files
+*.tmp
+*.log
+*.swp
+*~
+
+# weight
+*.bin
+*.pth
+*.pt
+*.ckpt
+
+# data
+*.jpeg
+*.jpg
+*.png
+*.mp4
+*.gif
+*.DS_Store
+*.zip
+L4P-main/results

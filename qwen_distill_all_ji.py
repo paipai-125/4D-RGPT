@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# 开启 TF32 以加速
 torch.set_float32_matmul_precision('high') 
 
 import torch.nn as nn
@@ -25,6 +26,7 @@ sys.path.append(os.path.abspath(".")) # 当前目录
 try:
     from distill_utils import TeacherWrapper, D4DPerception, compute_distillation_loss
 except ImportError as e:
+    # 只有 rank 0 打印错误，避免刷屏，但在 import 失败时所有进程都应该退出
     print(f"Error importing distill_utils: {e}")
     sys.exit(1)
 
@@ -62,7 +64,7 @@ def load_video_pil(video_path, num_frames=16, target_resolution=448):
     为了适配 TeacherWrapper，这里直接返回 PIL Image 列表
     """
     if not os.path.exists(video_path):
-        # Don't print warning on every rank to avoid clutter, rely on main process or just skip
+        # 多进程环境下，不要随意 print，除非是 rank 0
         return None
         
     cap = cv2.VideoCapture(video_path)
@@ -81,9 +83,7 @@ def load_video_pil(video_path, num_frames=16, target_resolution=448):
             break
             
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # 保持原始分辨率或这里 resize？ TeacherWrapper 会处理 resize 到 224
-        # Student 需要 448
-        # 所以我们这里 resize 到 448 给 Student, TeacherWrapper 内部会再 resize 到 224
+        # resize 到 448 给 Student, TeacherWrapper 内部会再 resize 适配 L4P
         frame = cv2.resize(frame, (target_resolution, target_resolution), interpolation=cv2.INTER_CUBIC)
         frame_pil = Image.fromarray(frame)
         frames.append(frame_pil)
@@ -99,36 +99,44 @@ def load_video_pil(video_path, num_frames=16, target_resolution=448):
     return frames
 
 def main():
-    # DDP Initialization
+    # ==========================
+    # DDP Initialization / 多卡初始化
+    # ==========================
+    # 检查是否是 DDP 运行环境 (通过 torchrun 启动会有这些环境变量)
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
     ddp_enabled = local_rank != -1
 
     if ddp_enabled:
+        # 初始化进程组，使用 nccl 后端（GPU 推荐）
         dist.init_process_group(backend="nccl")
+        # 设置当前设备
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
     else:
+        # 单卡或非分布式环境
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         rank = 0
         world_size = 1
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device: {device}")
+        print(f"Using device: {device} (Non-Distributed Mode)")
 
-    # Redirect stdout only for rank 0
+    # ==========================
+    # Logger Setup
+    # ==========================
+    # 只有主进程 (Global Rank 0) 负责写日志
     if rank == 0:
         sys.stdout = Logger("output_dis.txt")
+        print(f"Distributed Training: {ddp_enabled}")
+        print(f"Global Rank: {rank}, World Size: {world_size}")
     else:
-        # Suppress output from other ranks
+        # 其他进程静默，避免日志混乱
         sys.stdout = open(os.devnull, 'w')
-    
-    if rank == 0:
-        print(f"Distributed Training: {ddp_enabled}, World Size: {world_size}")
 
     # Configuration
-    local_model_path = "./src/models/Qwen3-VL-8B-Instruct"
-    data_json_path = "./RoboFAC/training_qa.json"
-    data_root = "./RoboFAC/simulation_data"
+    local_model_path = "../4D-Data/models/Qwen3-VL-2B-Instruct"
+    data_json_path = "../4D-Data/RoboFAC/training_qa.json"
+    data_root = "../4D-Data/RoboFAC/simulation_data"
     num_frames = 16
     target_resolution = 448
     limit_samples = 10
@@ -138,25 +146,28 @@ def main():
     # Distillation Params
     alpha = 0.5 # Latent Loss
     beta = 0.1  # Explicit Loss
-
+    
     # ==========================
     # 1. Load Student Model & Processor
     # ==========================
     if rank == 0:
         print("Loading processor and student model...")
+    
     try:
         processor = AutoProcessor.from_pretrained(local_model_path, trust_remote_code=True)
-        # 关键修改：DDP模式下，device_map 不能为 "auto"
+        # DDP 模式下，必须设置为 device_map=None，并手动 to(device)
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             local_model_path,
-            torch_dtype=torch.float32 if device != "cpu" else torch.float32,
-            device_map=None, # DDP 必须手动管理 device
+            torch_dtype=torch.float32,
+            device_map=None, 
             trust_remote_code=True
         )
         model.to(device)
     except Exception as e:
-        print(f"Error loading student model: {e}")
+        if rank == 0: 
+            print(f"Error loading student model: {e}")
         return
+        
     if rank == 0:
         print("Student Model loaded.")
 
@@ -177,47 +188,42 @@ def main():
         lora_alpha=32,
         lora_dropout=0.1,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        modules_to_save=["merger", "attn_pool"] # Detect dynamically if needed, kept simple here
+        modules_to_save=["merger", "attn_pool"] 
     )
     
-    # Capture hidden size before PEFT wrapping just in case
-    # Qwen3VLConfig has sub-configs. The LLM hidden size is usually in model.config.text_config.hidden_size
+    # Auto-detect hidden size
     if hasattr(model.config, "text_config") and hasattr(model.config.text_config, "hidden_size"):
         student_hidden_dim = model.config.text_config.hidden_size
     elif hasattr(model.config, "hidden_size"):
         student_hidden_dim = model.config.hidden_size
     else:
-        # Fallback for Qwen2-VL/Qwen3-VL specific structure if accessed differently
-        # Based on config.json, it's inside text_config
-        student_hidden_dim = 3136
+        student_hidden_dim = 3136 # Fallback
         if rank == 0:
             print(f"Warning: Could not auto-detect hidden size, using default {student_hidden_dim}")
     
     model = get_peft_model(model, peft_config)
     
-    # Wrap with DDP
+    # Wrap Student with DDP
     if ddp_enabled:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-
+    
     # ==========================
     # 2. Initialize Teacher Model
     # ==========================
     if rank == 0:
         print("Initializing Teacher Model (L4P)...")
     
-    # TeacherWrapper 内部使用 Fabric。如果是 DDP 环境，Fabric 应该会复用已有的进程组或者报错。
-    # 我们这里传入 device，并希望它正常工作。
+    # TeacherWrapper 内部可能使用 Fabric
+    # 我们希望它在当前 device 上运行且不干扰 DDP
     try:
-        teacher = TeacherWrapper(device=device) # Loads weights internally
+        # 注意: TeacherWrapper 内部初始化 Fabric 时需确保不会重新初始化 group
+        # 如果 L4P 代码中 fabric 设置为 auto，可能会通过环境变量检测到
+        teacher = TeacherWrapper(device=device) 
     except RuntimeError as e:
-        if "Fabric" in str(e):
-             print(f"Warning: Fabric initialization issue. Ensure running with torchrun/accelerate. Error: {e}")
-             # 如果实在不行，可能需要 hack L4P 代码，或者在这里尝试重新初始化 Fabric 的逻辑（很难）
-             raise e
-        else:
-             raise e
-
-    # Teacher is already frozen in wrapper
+        # 如果 Fabric 报错，通常需要在 teacher wrapper 里调整初始化逻辑
+        # 但如果是按我们修改过的 l4p/utils.py (devices=1)，配合 torchrun 应该正常
+        raise e
+        
     if rank == 0:
         print("Teacher Model initialized.")
 
@@ -226,31 +232,31 @@ def main():
     # ==========================
     if rank == 0:
         print("Initializing D4DP Decoder...")
-    # student_hidden_dim defined above
+        
     d4dp = D4DPerception(input_dim=student_hidden_dim, output_dim=1408)
     d4dp.to(device)
-    # Ensure D4DP is in same dtype as model (Float16) if model is Float16
+    # Convert to float32
     d4dp = d4dp.to(dtype=torch.float32, device=device)
-        
-    # D4DP weights need training
     d4dp.train()
     
+    # Wrap D4DP with DDP
     if ddp_enabled:
         d4dp = DDP(d4dp, device_ids=[local_rank])
-
+    
     # ==========================
     # 4. Optimizer & Data
     # ==========================
-    # Optimize both LoRA parameters and D4DP parameters
     params_to_optimize = list(model.parameters()) + list(d4dp.parameters())
     optimizer = torch.optim.AdamW(params_to_optimize, lr=learning_rate)
 
     if rank == 0:
         print("Loading dataset...")
+        
+    all_valid_samples = []
+    # 只有主进程读取文件没必要，为了简单可以都读，耗时不多
     with open(data_json_path, 'r') as f:
         full_data = json.load(f)
 
-    all_valid_samples = []
     for item in full_data:
         vid_rel_path = item.get('video')
         if not vid_rel_path: continue
@@ -266,23 +272,31 @@ def main():
                     "answer": answer
                 })
     
-    # Use All Valid Samples (Shuffle for randomness)
+    # Shuffle (确保所有 rank 使用相同的种子，这样 shuffle 结果一致)
     import random
     random.seed(42)
     random.shuffle(all_valid_samples)
     
-    # Data Sharding for DDP
-    if ddp_enabled:
-        # 简单的分片逻辑：step = world_size, start = rank
-        training_samples = all_valid_samples[rank::world_size]
-    else:
-        training_samples = all_valid_samples
+    # 确保数据总量能被 world_size 整除，防止最后一个 epoch 因为步数对不齐而卡死 (Hang)
+    if len(all_valid_samples) % world_size != 0:
+        new_len = len(all_valid_samples) - (len(all_valid_samples) % world_size)
+        if rank == 0:
+            print(f"Trimming dataset from {len(all_valid_samples)} to {new_len} to fit uniformly across {world_size} GPUs.")
+        all_valid_samples = all_valid_samples[:new_len]
+
+    # Data Sharding (关键: 多机多卡/单机多卡 都通过 rank 和 world_size 分片)
+    # 简单的分片策略：step = world_size
+    # Rank 0: [0, 4, 8...]
+    # Rank 1: [1, 5, 9...]
+    # ...
+    # 这样每个样本只被一个 GPU 处理
+    training_samples = all_valid_samples[rank::world_size]
     
     if rank == 0:
         print(f"Total JSON entries: {len(full_data)}")
-        print(f"Valid samples found (videos exist): {len(all_valid_samples)}")
-        print(f"Skipped samples: {len(full_data) - len(all_valid_samples)}")
-        print(f"Prepared {len(training_samples)} samples for this rank (Rank {rank}).")
+        print(f"Total Valid samples: {len(all_valid_samples)}")
+        print(f"Samples per GPU (approx): {len(training_samples)}")
+        print(f"Prepared {len(training_samples)} samples for this process (Rank {rank}).")
 
     # Training Setup
     num_training_steps = num_epochs * len(training_samples)
@@ -301,8 +315,8 @@ def main():
         if rank == 0:
             print(f"\n===== Epoch {epoch+1}/{num_epochs} =====")
         
-        # 为了更准确的 shuffling，通常在每个 epoch 开始前重新 sample。
-        # 这里为了简单，保持固定 shard。如果想每个 epoch 不同，需要使用 DistributedSampler 配合 DataLoader。
+        # 为了 DDP shuffle 更好，通常使用 DistributedSampler 并在每个 epoch set_epoch
+        # 这里使用了简单的静态切片，每个 epoch 处理相同的数据子集
         
         epoch_loss_total = 0.0
         epoch_loss_sft = 0.0
@@ -313,18 +327,15 @@ def main():
             question = sample['question']
             answer = sample['answer']
             
-            # Load frames (List of PIL Images)
+            # Load frames
             frames_pil = load_video_pil(video_path, num_frames=num_frames, target_resolution=target_resolution)
             if frames_pil is None: continue
                 
             # --- Teacher Forward ---
-            # Pass frames to teacher (batch size 1 wrapper needs list of list of frames)
-            # TeacherWrapper.forward expects [ [frame1, frame2...] ]
             with torch.no_grad():
                 f_4d_teacher, p_m_teacher = teacher.forward([frames_pil])
                 
             # --- Student Input Prep ---
-            # Standard Qwen3-VL processing
             messages = [
                 {
                     "role": "user",
@@ -340,7 +351,6 @@ def main():
             ]
             text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
             
-            # 手动调整像素尺寸限制
             inputs = processor(
                 text=[text],
                 images=frames_pil,
@@ -353,87 +363,54 @@ def main():
     # Create Labels
             labels = inputs["input_ids"].clone()
             
-            # --- SFT Masking Logic: Mask out the user prompt ---
+            # SFT Masking
             im_start_id = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
-            # If not found directly, fallback to heuristic or skip precise masking if risky.
-            
             if im_start_id is not None:
-                # Iterate over batch
                 for batch_idx in range(labels.shape[0]):
-                    # Find indices of <|im_start|>
                     start_indices = (labels[batch_idx] == im_start_id).nonzero(as_tuple=True)[0]
                     if len(start_indices) > 0:
                         last_start_idx = start_indices[-1]
                         mask_len = last_start_idx + 2 
                         labels[batch_idx, :mask_len] = -100
             
-            # Also mask padding
             if processor.tokenizer.pad_token_id is not None:
                 labels[labels == processor.tokenizer.pad_token_id] = -100
             
             inputs["labels"] = labels
             
-            # =========================================================================
-            # Debug: Print sample information and shapes for distilation check
-            # =========================================================================
-            if rank == 0:
-                print(f"-" * 40)
-                print(f"Sample {i+1}/{len(training_samples)}")
-            
             # --- Student Forward ---
-            # Enable output_hidden_states to get embeddings
             outputs = model(**inputs, output_hidden_states=True)
             loss_sft = outputs.loss
             
             # --- Distillation Logic ---
-            # 1. Extract Student Hidden States corresponding to Video using Special Tokens
-            last_hidden_state = outputs.hidden_states[-1] # (B, Seq_Len, Dim)
+            last_hidden_state = outputs.hidden_states[-1] 
             
-            # 获取 ID
             vision_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
             vision_end_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
             
-            # 定位视觉 Token
-            ids = inputs["input_ids"][0] # (Seq_Len,)
+            ids = inputs["input_ids"][0]
             locs_start = (ids == vision_start_id).nonzero(as_tuple=True)[0]
             locs_end = (ids == vision_end_id).nonzero(as_tuple=True)[0]
             
+            loss_distill = torch.tensor(0.0, device=device)
             loss_ld = 0.0
             loss_ed = 0.0
-            loss_distill = 0.0
             
-            f_4d_student = None
-            
-            # Use same logic as qwen_train.py to extract all visual tokens
             if len(locs_start) > 0 and len(locs_end) > 0:
                 visual_tokens_list = []
-                # Collect tokens from all image segments
                 for s, e in zip(locs_start, locs_end):
                     segment = last_hidden_state[:, s+1 : e, :]
                     visual_tokens_list.append(segment)
                 
-                # Concatenate all visual segments
-                student_visual_hidden = torch.cat(visual_tokens_list, dim=1) # (B, Total_Vis, C)
+                student_visual_hidden = torch.cat(visual_tokens_list, dim=1)
                 
-                # print(f"Extracted Visual Tokens Count: {student_visual_hidden.shape}")
-                
-                # 2. D4DP Projection & Input
-                # D4DP internally handles arbitrary length if configured, or we pass dimensions
-                # Pass grid dimensions to D4DP if available to handle dynamic reshape
                 grid_thw = inputs.get("image_grid_thw", None)
                 
-                # Try to run D4DP
                 try:
-                    f_4d_student = d4dp(student_visual_hidden, grid_thw=grid_thw) # (B, T_s*H_s*W_s -> T_t*H_t*W_t, C_out)
-                    # print(f"D4DP Output Latent 4D Shape (Student): {f_4d_student.shape}")
+                    f_4d_student = d4dp(student_visual_hidden, grid_thw=grid_thw)
                     
-                    # 3. Explicit Decoding
                     p_m_student = teacher.decode_student_features(f_4d_student)
-                    # print("Student Explicit Signals Shapes:")
-                    # for k, v in p_m_student.items():
-                    #     print(f"  {k}: {v.shape}")
 
-                    # 4. Compute Distillation Loss
                     loss_distill, loss_components = compute_distillation_loss(
                         f_4d_student, 
                         f_4d_teacher, 
@@ -453,11 +430,9 @@ def main():
                     else:
                         loss_ed = loss_components["loss_ed"]
                 except RuntimeError as e:
-                    print(f"D4DP/Distill Error (Shape Mismatch?): {e}")
-                    loss_distill = 0.0 # Skip this sample
-            else:
-                if rank == 0:
-                    print("Warning: Could not find vision_start/end tokens. Skipping distill.")
+                    if rank == 0:
+                        print(f"D4DP/Distill Error (Shape Mismatch?): {e}")
+                    loss_distill = torch.tensor(0.0, device=device)
             
             # --- Total Loss & Backward ---
             total_loss = loss_sft + loss_distill
@@ -468,38 +443,39 @@ def main():
             optimizer.step()
             scheduler.step()
             
-            # Logging
-            current_lr = optimizer.param_groups[0]['lr']
-            # if i % 1 == 0:
-            loss_distill_val = loss_distill.item() if isinstance(loss_distill, torch.Tensor) else loss_distill
-            
+            # Logging (Rank 0 only)
             if rank == 0:
-                print(f"Loss Total: {total_loss.item():.4f} | SFT: {loss_sft.item():.4f} | Distill: {loss_distill_val:.4f} (LD: {loss_ld:.4f}, ED: {loss_ed:.4f}) | LR: {current_lr:.2e}")
-            
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(f"Sample {i+1}/{len(training_samples)} | Loss Total: {total_loss.item():.4f} | SFT: {loss_sft.item():.4f} | Distill: {loss_distill.item():.4f} (LD: {loss_ld:.4f}, ED: {loss_ed:.4f} | LR: {current_lr:.2e})")
+
             epoch_loss_total += total_loss.item()
             epoch_loss_sft += loss_sft.item()
-            epoch_loss_distill += loss_distill_val
+            epoch_loss_distill += loss_distill.item()
         
-        # 这里计算的是当前 rank 的平均 loss。如果需要全局平均，需要 all_reduce (略)
-        avg_total = epoch_loss_total / len(training_samples)
-        avg_sft = epoch_loss_sft / len(training_samples)
-        avg_distill = epoch_loss_distill / len(training_samples)
+        # Calculate Average for this Process
+        avg_total = epoch_loss_total / max(len(training_samples), 1)
+        avg_sft = epoch_loss_sft / max(len(training_samples), 1)
+        avg_distill = epoch_loss_distill / max(len(training_samples), 1)
         
         if rank == 0:
-            print(f"Epoch {epoch+1} Avg Loss (Rank 0): {avg_total:.4f} | Avg SFT: {avg_sft:.4f} | Avg Distill: {avg_distill:.4f}")
+            print(f"Epoch {epoch+1} Avg Loss (Rank 0 view): {avg_total:.4f} | Avg SFT: {avg_sft:.4f} | Avg Distill: {avg_distill:.4f}")
             
-            # Save Checkpoint (Model + D4DP)
-            save_dir = os.path.join("checkpoints_distill", f"epoch_{epoch+1}")
+            # Save Checkpoint (Only Rank 0 saves)
+            # Make sure it's adjacent to 4D-RGPT in 4D-Data
+            save_root = os.path.abspath(os.path.join(os.getcwd(), "..", "4D-Data", "checkpoints_distill"))
+            save_dir = os.path.join(save_root, f"epoch_{epoch+1}")
             os.makedirs(save_dir, exist_ok=True)
+            
             # Unwrap DDP
             model_to_save = model.module if ddp_enabled else model
             model_to_save.save_pretrained(save_dir)
             processor.save_pretrained(save_dir)
-            # Save separate D4DP weights
+            
             d4dp_to_save = d4dp.module if ddp_enabled else d4dp
             torch.save(d4dp_to_save.state_dict(), os.path.join(save_dir, "d4dp.pt"))
-            print(f"Saved to {save_dir}")
-
+            print(f"Saved checkpoint to {save_dir}")
+            
+    # Cleanup
     if ddp_enabled:
         dist.destroy_process_group()
 
