@@ -140,7 +140,7 @@ def main():
     num_frames = 16
     target_resolution = 448
     limit_samples = 10
-    num_epochs = 10
+    num_epochs = 5
     learning_rate = 2e-5
     
     # Distillation Params
