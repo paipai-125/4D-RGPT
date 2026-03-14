@@ -1,5 +1,3 @@
-# Train file
-
 import os
 # 在导入任何可能使用OpenMP的库之前设置环境变量
 os.environ['OMP_NUM_THREADS'] = '4'

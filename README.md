@@ -110,3 +110,12 @@ torchrun --nproc_per_node=8 qwen_distill_all_ji.py
 
 Training logs will be saved to `output_dis.txt`.
 Checkpoints are saved in `4D-Data/checkpoints_distill/`.
+
+
+## 推理 (Inference)
+
+Run the base model inference directly:
+
+```bash
+torchrun --nproc_per_node=8 base_test.py
+```
