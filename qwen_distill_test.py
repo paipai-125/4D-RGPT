@@ -65,7 +65,7 @@ def main():
     # Configuration
     # ==========================
     base_model_path = "../4D-Data/models/Qwen3-VL-2B-Instruct"
-    adapter_path = "../4D-Data/checkpoints/epoch_5" # 指向第5轮权重
+    adapter_path = "../4D-Data/checkpoints/epoch_5"
     data_root = "../4D-Data/RoboFAC/simulation_data"
     data_json_path = "../4D-Data/RoboFAC/training_qa.json"
     
