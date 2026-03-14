@@ -1,6 +1,6 @@
 import os
 # 在导入任何可能使用OpenMP的库之前设置环境变量
-os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['OMP_NUM_THREADS'] = '1'
 
 import sys
 import json
@@ -145,6 +145,7 @@ def main():
     # Distillation Params
     alpha = 0.5 # Latent Loss
     beta = 0.1  # Explicit Loss
+    accumulation_steps = 32 # Gradient Accumulation Steps
     
     # ==========================
     # 1. Load Student Model & Processor
@@ -276,7 +277,7 @@ def main():
     random.seed(42)
     random.shuffle(all_valid_samples)
     
-    # 确保数据总量能被 world_size 整除，防止最后一个 epoch 因为步数对不齐而卡死 (Hang)
+    # 确保数据总量能被 world_size 整除，防止最后一个 epoch 因为步数对不齐而卡死
     if len(all_valid_samples) % world_size != 0:
         new_len = len(all_valid_samples) - (len(all_valid_samples) % world_size)
         if rank == 0:
@@ -296,9 +297,10 @@ def main():
         print(f"Total Valid samples: {len(all_valid_samples)}")
         print(f"Samples per GPU (approx): {len(training_samples)}")
         print(f"Prepared {len(training_samples)} samples for this process (Rank {rank}).")
+        print(f"Accumulation steps: {accumulation_steps}")
 
     # Training Setup
-    num_training_steps = num_epochs * len(training_samples)
+    num_training_steps = num_epochs * (len(training_samples) // accumulation_steps)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, 
         num_warmup_steps=int(0.1 * num_training_steps),
@@ -306,7 +308,10 @@ def main():
     )
     
     model.train()
+    optimizer.zero_grad() # Initialize gradients
     
+    global_step_counter = 0
+
     # ==========================
     # 5. Training Loop
     # ==========================
@@ -436,11 +441,17 @@ def main():
             # --- Total Loss & Backward ---
             total_loss = loss_sft + loss_distill
             
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(params_to_optimize, max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+            # Gradient Accumulation
+            loss = total_loss / accumulation_steps
+            loss.backward()
+            
+            global_step_counter += 1
+
+            if global_step_counter % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(params_to_optimize, max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
             
             # Logging (Rank 0 only)
             if rank == 0:
