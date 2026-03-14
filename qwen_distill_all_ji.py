@@ -64,7 +64,6 @@ def load_video_pil(video_path, num_frames=16, target_resolution=448):
     为了适配 TeacherWrapper，这里直接返回 PIL Image 列表
     """
     if not os.path.exists(video_path):
-        # 多进程环境下，不要随意 print，除非是 rank 0
         return None
         
     cap = cv2.VideoCapture(video_path)
