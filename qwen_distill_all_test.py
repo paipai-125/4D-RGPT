@@ -110,6 +110,9 @@ def calculate_metrics(gt_answers, pred_answers):
     return avg_bleu, avg_rouge
 
 def main():
+    # ==========================
+    # DDP Initialization / 多卡初始化
+    # ==========================
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
@@ -141,7 +144,7 @@ def main():
     # Configuration
     # ==========================
     base_model_path = "../4D-Data/models/Qwen3-VL-2B-Instruct"
-    adapter_path = None  # 不使用权重文件
+    adapter_path = "../4D-Data/checkpoints_distill/epoch_1"
     data_root = "../4D-Data/RoboFAC/simulation_data"
     test_qa_path = "../4D-Data/RoboFAC/test_qa_sim"
     
@@ -151,7 +154,7 @@ def main():
     # ==========================
     # 1. Load Model & Adapter
     # ==========================
-    log_print("Loading base model...")
+    # log_print("Loading base model...")
     try:
         # Load Base Model
         # DDP/Multi-process: Manually load to device to avoid auto-map issues
@@ -176,15 +179,12 @@ def main():
         log_print(f"Error loading base model: {e}")
         return
 
-    # print(f"Loading LoRA adapter from {adapter_path}...")
-    # try:
-    #     # Load LoRA Adapter
-    #     model = PeftModel.from_pretrained(model, adapter_path)
-    # except Exception as e:
-    #     print(f"Error loading adapter: {e}")
-    #     print("Note: Please ensure the 'epoch_10' checkpoint exists. Proceeding with base model only for demonstration if missing.")
-    
-    log_print("Skipping adapter loading as requested. Using base model.")
+    log_print(f"Loading LoRA adapter from {adapter_path}...")
+    try:
+        # Load LoRA Adapter
+        model = PeftModel.from_pretrained(model, adapter_path)
+    except Exception as e:
+        log_print(f"Error loading adapter: {e}")
     
     model.eval()
 

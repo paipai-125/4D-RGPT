@@ -27,8 +27,7 @@ try:
     from distill_utils import TeacherWrapper, D4DPerception, compute_distillation_loss
 except ImportError as e:
     # 只有 rank 0 打印错误，避免刷屏，但在 import 失败时所有进程都应该退出
-    print(f"Error importing distill_utils: {e}")
-    sys.exit(1)
+    pass # SFT不一定需要distill_utils
 
 # Logger to capture all output
 class Logger(object):
@@ -168,7 +167,7 @@ def main():
         return
         
     if rank == 0:
-        print("Student Model loaded.")
+        print("Qwen3 Model loaded.")
 
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
@@ -207,45 +206,9 @@ def main():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     
     # ==========================
-    # 2. Initialize Teacher Model
+    # 2. Optimizer & Data
     # ==========================
-    if rank == 0:
-        print("Initializing Teacher Model (L4P)...")
-    
-    # TeacherWrapper 内部可能使用 Fabric
-    # 我们希望它在当前 device 上运行且不干扰 DDP
-    try:
-        # 注意: TeacherWrapper 内部初始化 Fabric 时需确保不会重新初始化 group
-        # 如果 L4P 代码中 fabric 设置为 auto，可能会通过环境变量检测到
-        teacher = TeacherWrapper(device=device) 
-    except RuntimeError as e:
-        # 如果 Fabric 报错，通常需要在 teacher wrapper 里调整初始化逻辑
-        # 但如果是按我们修改过的 l4p/utils.py (devices=1)，配合 torchrun 应该正常
-        raise e
-        
-    if rank == 0:
-        print("Teacher Model initialized.")
-
-    # ==========================
-    # 3. Initialize D4DP (4D Perception Decoder)
-    # ==========================
-    if rank == 0:
-        print("Initializing D4DP Decoder...")
-        
-    d4dp = D4DPerception(input_dim=student_hidden_dim, output_dim=1408)
-    d4dp.to(device)
-    # Convert to float32
-    d4dp = d4dp.to(dtype=torch.float32, device=device)
-    d4dp.train()
-    
-    # Wrap D4DP with DDP
-    if ddp_enabled:
-        d4dp = DDP(d4dp, device_ids=[local_rank])
-    
-    # ==========================
-    # 4. Optimizer & Data
-    # ==========================
-    params_to_optimize = list(model.parameters()) + list(d4dp.parameters())
+    params_to_optimize = list(model.parameters())
     optimizer = torch.optim.AdamW(params_to_optimize, lr=learning_rate)
 
     if rank == 0:
@@ -327,8 +290,6 @@ def main():
         # 这里使用了简单的静态切片，每个 epoch 处理相同的数据子集
         
         epoch_loss_total = 0.0
-        epoch_loss_sft = 0.0
-        epoch_loss_distill = 0.0
         
         for i, sample in enumerate(training_samples):
             video_path = sample['video_path']
@@ -338,10 +299,6 @@ def main():
             # Load frames
             frames_pil = load_video_pil(video_path, num_frames=num_frames, target_resolution=target_resolution)
             if frames_pil is None: continue
-                
-            # --- Teacher Forward ---
-            with torch.no_grad():
-                f_4d_teacher, p_m_teacher = teacher.forward([frames_pil])
                 
             # --- Student Input Prep ---
             messages = [
@@ -387,67 +344,20 @@ def main():
             inputs["labels"] = labels
             
             # --- Student Forward ---
-            outputs = model(**inputs, output_hidden_states=True)
+            outputs = model(**inputs, output_hidden_states=False)
             loss_sft = outputs.loss
             
-            # --- Distillation Logic ---
-            last_hidden_state = outputs.hidden_states[-1] 
-            
-            vision_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-            vision_end_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
-            
-            ids = inputs["input_ids"][0]
-            locs_start = (ids == vision_start_id).nonzero(as_tuple=True)[0]
-            locs_end = (ids == vision_end_id).nonzero(as_tuple=True)[0]
-            
-            loss_distill = torch.tensor(0.0, device=device)
-            loss_ld = 0.0
-            loss_ed = 0.0
-            
-            if len(locs_start) > 0 and len(locs_end) > 0:
-                visual_tokens_list = []
-                for s, e in zip(locs_start, locs_end):
-                    segment = last_hidden_state[:, s+1 : e, :]
-                    visual_tokens_list.append(segment)
-                
-                student_visual_hidden = torch.cat(visual_tokens_list, dim=1)
-                
-                grid_thw = inputs.get("image_grid_thw", None)
-                
-                try:
-                    f_4d_student = d4dp(student_visual_hidden, grid_thw=grid_thw)
-                    
-                    p_m_student = teacher.decode_student_features(f_4d_student)
-
-                    loss_distill, loss_components = compute_distillation_loss(
-                        f_4d_student, 
-                        f_4d_teacher, 
-                        p_m_student, 
-                        p_m_teacher, 
-                        alpha=alpha, 
-                        beta=beta
-                    )
-                    
-                    if isinstance(loss_components["loss_ld"], torch.Tensor):
-                        loss_ld = loss_components["loss_ld"].item()
-                    else:
-                        loss_ld = loss_components["loss_ld"]
-                        
-                    if isinstance(loss_components["loss_ed"], torch.Tensor):
-                        loss_ed = loss_components["loss_ed"].item()
-                    else:
-                        loss_ed = loss_components["loss_ed"]
-                except RuntimeError as e:
-                    if rank == 0:
-                        print(f"D4DP/Distill Error (Shape Mismatch?): {e}")
-                    loss_distill = torch.tensor(0.0, device=device)
-            
             # --- Total Loss & Backward ---
-            total_loss = loss_sft + loss_distill
+            total_loss = loss_sft
             
             # Gradient Accumulation
             loss = total_loss / accumulation_steps
             loss.backward()
+
+            # Logging (Rank 0 only) - Print BEFORE step
+            if rank == 0 and global_step_counter % accumulation_steps == 0:
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(f"Sample {i+1}/{len(training_samples)} | Loss Total: {total_loss.item():.4f} | LR: {current_lr:.2e}")
             
             global_step_counter += 1
 
@@ -456,27 +366,18 @@ def main():
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            
-            # Logging (Rank 0 only)
-            if rank == 0:
-                current_lr = optimizer.param_groups[0]["lr"]
-                print(f"Sample {i+1}/{len(training_samples)} | Loss Total: {total_loss.item():.4f} | SFT: {loss_sft.item():.4f} | Distill: {loss_distill.item():.4f} (LD: {loss_ld:.4f}, ED: {loss_ed:.4f} | LR: {current_lr:.2e})")
 
             epoch_loss_total += total_loss.item()
-            epoch_loss_sft += loss_sft.item()
-            epoch_loss_distill += loss_distill.item()
         
         # Calculate Average for this Process
         avg_total = epoch_loss_total / max(len(training_samples), 1)
-        avg_sft = epoch_loss_sft / max(len(training_samples), 1)
-        avg_distill = epoch_loss_distill / max(len(training_samples), 1)
         
         if rank == 0:
-            print(f"Epoch {epoch+1} Avg Loss (Rank 0 view): {avg_total:.4f} | Avg SFT: {avg_sft:.4f} | Avg Distill: {avg_distill:.4f}")
+            print(f"Epoch {epoch+1} Avg Loss (Rank 0 view): {avg_total:.4f}")
             
             # Save Checkpoint (Only Rank 0 saves)
             # Make sure it's adjacent to 4D-RGPT in 4D-Data
-            save_root = os.path.abspath(os.path.join(os.getcwd(), "..", "4D-Data", "checkpoints_distill"))
+            save_root = os.path.abspath(os.path.join(os.getcwd(), "..", "4D-Data", "checkpoints_sft"))
             save_dir = os.path.join(save_root, f"epoch_{epoch+1}")
             os.makedirs(save_dir, exist_ok=True)
             
@@ -485,8 +386,6 @@ def main():
             model_to_save.save_pretrained(save_dir)
             processor.save_pretrained(save_dir)
             
-            d4dp_to_save = d4dp.module if ddp_enabled else d4dp
-            torch.save(d4dp_to_save.state_dict(), os.path.join(save_dir, "d4dp.pt"))
             print(f"Saved checkpoint to {save_dir}")
             
     # Cleanup
