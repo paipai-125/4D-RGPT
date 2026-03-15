@@ -102,6 +102,13 @@ cd 4D-RGPT
 torchrun --nproc_per_node=8 qwen_distill_all_ji.py
 ```
 
+Only run the sft training script:
+
+```bash
+cd 4D-RGPT
+torchrun --nproc_per_node=8 qwen_sft_train.py
+```
+
 ### Notes on Configuration
 - **Batch Size / CUDA Memory**: Adjust `parameters` in `qwen_distill_all_ji.py` if running out of memory.
 - **L4P Integration**: Ensure that the necessary weights of L4P is saved in `4D-Data/l4p-weights/`.
