@@ -129,7 +129,6 @@ def main():
         print(f"Distributed Training: {ddp_enabled}")
         print(f"Global Rank: {rank}, World Size: {world_size}")
     else:
-        # 其他进程静默，避免日志混乱
         sys.stdout = open(os.devnull, 'w')
 
     # Configuration
