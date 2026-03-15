@@ -144,7 +144,7 @@ def main():
     # Configuration
     # ==========================
     base_model_path = "../4D-Data/models/Qwen3-VL-2B-Instruct"
-    adapter_path = "../4D-Data/checkpoints_distill/epoch_1"
+    adapter_path = "../4D-Data/checkpoints_distill/epoch_1"  #修改epoch
     data_root = "../4D-Data/RoboFAC/simulation_data"
     test_qa_path = "../4D-Data/RoboFAC/test_qa_sim"
     
