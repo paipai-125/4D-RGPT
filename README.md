@@ -99,15 +99,17 @@ Usually, you can run the distillation training script directly:
 
 ```bash
 cd 4D-RGPT
-torchrun --nproc_per_node=8 qwen_distill_all_ji.py
+torchrun --nproc_per_node=8 train_robo_distill.py
 ```
 
 Only run the sft training script:
 
 ```bash
 cd 4D-RGPT
-torchrun --nproc_per_node=8 qwen_sft_train.py
+torchrun --nproc_per_node=8 train_robo_sft.py
 ```
+
+You can modify the filename for training different datasets.
 
 ### Notes on Configuration
 - **Batch Size / CUDA Memory**: Adjust `parameters` in `qwen_distill_all_ji.py` if running out of memory.
@@ -125,11 +127,13 @@ Run the base model inference:
 
 ```bash
 pip install nltk rouge tqdm
-torchrun --nproc_per_node=8 base_test.py
+torchrun --nproc_per_node=8 test_robo_base.py
 ```
 
-Run the sft model inference:
+Run the distill model inference:
 
 ```bash
-torchrun --nproc_per_node=8 qwen_distill_all_test.py
+torchrun --nproc_per_node=8 test_robo_distill.py
 ```
+
+You can modify the filename for testing different datasets.
