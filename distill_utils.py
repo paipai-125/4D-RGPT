@@ -43,7 +43,7 @@ class TeacherWrapper(nn.Module):
              device_idx = [device]
 
         # 加载 L4P 模型
-        print(f"[TeacherWrapper] Loading L4P model from {ckpt_path} on device {device_idx}...")
+        print(f"Loading L4P model from {ckpt_path} on device {device_idx}...")
         self.model = prepare_model(
             model_config_path=config_path,
             ckpt_path=ckpt_path,
