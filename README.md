@@ -79,6 +79,18 @@ bash download.sh
 
 Put `l4p_depth_flow_2d3dtrack_camray_dynseg_v1.ckpt` at `4D-Data/l4p-weights`.
 
+### 下载 Orient Anything V2 模型
+
+```bash
+cd 4D-RGPT/Orient-Anything-V2
+pip install -r requirements.txt
+cd ../../4D-Data
+huggingface-cli download Viglong/OriAnyV2_ckpt \
+  --repo-type model \
+  --include "demo_ckpts/rotmod_realrotaug_best.pt" \
+  --local-dir OriAnyV2_ckpt
+```
+
 
 Verify the structure:
 ```
@@ -89,6 +101,7 @@ Verify the structure:
 4D-Data/
 ├── l4p-weights/
 └── models/
+├── OriAnyV2_ckpt/
 └── RoboFAC/
 ```
 
