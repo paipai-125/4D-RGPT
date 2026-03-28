@@ -952,7 +952,7 @@ def main():
                 optimizer.zero_grad()
             
             # Logging (Rank 0 only)
-            if rank == 0:
+            if rank == 0 and global_step_counter % accumulation_steps == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
                 seg_val = loss_seg_distill.item() if isinstance(loss_seg_distill, torch.Tensor) else loss_seg_distill
                 ori_total_val = loss_ori_distill.item() if isinstance(loss_ori_distill, torch.Tensor) else loss_ori_distill
