@@ -1,4 +1,13 @@
 import os
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if os.path.join(current_dir, "Orient-Anything-V2") not in sys.path:
+    sys.path.append(os.path.join(current_dir, "Orient-Anything-V2"))
+if os.path.join(current_dir, "GroundingDINO") not in sys.path:
+    sys.path.append(os.path.join(current_dir, "GroundingDINO"))
+if os.path.join(current_dir, "sam2") not in sys.path:
+    sys.path.append(os.path.join(current_dir, "sam2"))
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,7 +52,7 @@ class TeacherWrapper(nn.Module):
              device_idx = [device]
 
         # 加载 L4P 模型
-        print(f"Loading L4P model from {ckpt_path} on device {device_idx}...")
+        print(f"[TeacherWrapper] Loading L4P model from {ckpt_path} on device {device_idx}...")
         self.model = prepare_model(
             model_config_path=config_path,
             ckpt_path=ckpt_path,
@@ -411,7 +420,7 @@ class D4DPerception(nn.Module):
         return x
 
 
-def compute_distillation_loss(f_pred, f_true, p_pred_dict, p_true_dict, alpha=0.5, beta=0.1):
+def compute_distillation_loss(f_pred, f_true, p_pred_dict, p_true_dict, alpha=0.5, beta=0.1, weight_map=None):
     """
     计算总的蒸馏损失
     Args:
@@ -444,8 +453,17 @@ def compute_distillation_loss(f_pred, f_true, p_pred_dict, p_true_dict, alpha=0.
                 if pred.dim() == 5: # (B, C, T, H, W)
                      gt = F.interpolate(gt, size=pred.shape[2:], mode='nearest')
             
-            l = F.smooth_l1_loss(pred, gt, beta=1.0)
-            loss_ed += weights[key] * l
+            l = F.smooth_l1_loss(pred, gt, beta=1.0, reduction='none')
+            
+            if weight_map is not None and key in ['depth', 'flow', 'motion']:
+                w = weight_map.unsqueeze(0).unsqueeze(1) # (1, 1, T, H, W)
+                if w.shape[2:] != pred.shape[2:]:
+                    w = F.interpolate(w.float(), size=pred.shape[2:], mode='nearest')
+                l = l * w.to(l.device)
+                
+            task_loss = l.mean()
+            loss_dict[f"loss_{key}"] = task_loss
+            loss_ed += weights[key] * task_loss
             
     loss_dict["loss_ed"] = loss_ed
     
@@ -453,3 +471,284 @@ def compute_distillation_loss(f_pred, f_true, p_pred_dict, p_true_dict, alpha=0.
     loss_dict["loss_distill_total"] = total_distill_loss
     
     return total_distill_loss, loss_dict
+
+
+# ==========================================================
+# 新增的教师模型：SAM2 (含 GroundingDINO) 和 Orient Anything V2
+# ==========================================================
+import sys
+import os
+import cv2
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 为了避免 SAM2 的路径探测报错，我们把 SAM2 源码目录插入到 sys.path 的最前面
+sam2_path = os.path.abspath("./sam2")
+if sam2_path not in sys.path:
+    sys.path.insert(0, sam2_path)
+
+# 尝试导入 GroundingDINO, SAM2, Orient Anything V2相关的包
+try:
+    import groundingdino.datasets.transforms as T
+    from groundingdino.models import build_model as build_gdino_model
+    from groundingdino.util.slconfig import SLConfig
+    from groundingdino.util.utils import clean_state_dict
+    
+    from sam2.build_sam import build_sam2_video_predictor
+    
+    # 假设 Orient Anything V2 在 sys.path 中
+    from vision_tower import VGGT_OriAny_Ref
+    from utils.app_utils import background_preprocess
+except ImportError:
+    pass
+
+class GroundingDINOSAM2Teacher(nn.Module):
+    """
+    GroundingDINO 用于在第一帧根据 prompt 检测边界框
+    SAM2 根据检测框追踪这 16 帧得到 masks
+    """
+    def __init__(self, 
+                 gd_config="GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+                 gd_ckpt="GroundingDINO/weights/groundingdino_swint_ogc.pth",
+                 sam2_cfg="configs/sam2.1/sam2.1_hiera_b+.yaml",
+                 sam2_ckpt="../4D-Data/sam2_weights/sam2.1_hiera_base_plus.pt",
+                 device="cuda"):
+        super().__init__()
+        self.device = device
+        
+        # 1. 加载 GroundingDINO
+        args = SLConfig.fromfile(gd_config)
+        args.device = device
+        
+        # 修复离线网络找不到 bert-base-uncased 的问题
+        # 将 text_encoder_type 强制指向本地存在的文件夹
+        local_bert_path = os.path.abspath("GroundingDINO/bert-base-uncased")
+        if os.path.exists(local_bert_path):
+            args.text_encoder_type = local_bert_path
+
+        self.gd_model = build_gdino_model(args)
+        if os.path.exists(gd_ckpt):
+            checkpoint = torch.load(gd_ckpt, map_location="cpu")
+            self.gd_model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+        self.gd_model.to(device).eval()
+        
+        # 2. 加载 SAM2 Video Predictor
+        # 请根据具体 sam2 API 做调整
+        self.sam2_predictor = build_sam2_video_predictor(sam2_cfg, sam2_ckpt, device=device)
+        
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        self.gd_transform = T.Compose([
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+    @torch.no_grad()
+    def forward(self, frames_list, text_prompts, box_threshold=0.3, text_threshold=0.25, N=None):
+        """
+        frames_list: Batch of List[PIL.Image]
+        text_prompts: Batch of strings, e.g., ["robot arm.", "tool."]
+        Returns:
+            batch_masks_gt: List of length B. Each element is an array/tensor of shape (N_objects, T, H, W)
+            batch_boxes_gt: List of length B. Each element is a list of N_objects tracking boxes or first frame boxes
+        """
+        batch_masks = []
+        batch_boxes = []
+        
+        for b_idx in range(len(frames_list)):
+            frames = frames_list[b_idx] # List[PIL.Image] of length 16
+            prompt = text_prompts[b_idx]
+            
+            # 1. 使用 GroundingDINO 对第一帧进行检测
+            frame0_pil = frames[0].convert("RGB")
+            frame0_tensor, _ = self.gd_transform(frame0_pil, None)
+            frame0_tensor = frame0_tensor.to(self.device)[None]
+            
+            prompt = prompt.lower().strip()
+            if not prompt.endswith("."): prompt += "."
+            
+            gd_out = self.gd_model(frame0_tensor, captions=[prompt])
+            logits = gd_out["pred_logits"].sigmoid()[0]
+            boxes = gd_out["pred_boxes"][0]
+            
+            filt_mask = logits.max(dim=1)[0] > box_threshold
+            boxes_filt = boxes[filt_mask] # cx, cy, w, h in normalized [0,1]
+            logits_filt = logits.max(dim=1)[0][filt_mask]
+            
+            if N is not None and boxes_filt.shape[0] > N:
+                _, topk_idx = torch.topk(logits_filt, N)
+                boxes_filt = boxes_filt[topk_idx]
+            
+            W, H = frame0_pil.size
+            if len(boxes_filt) == 0:
+                batch_masks.append(torch.zeros((0, len(frames), H, W)))
+                batch_boxes.append([])
+                continue
+                
+            # Convert cxcywh to xyxy
+            boxes_abs = boxes_filt * torch.tensor([W, H, W, H], device=self.device)
+            boxes_xyxy = boxes_abs.clone()
+            boxes_xyxy[:, 0] = boxes_abs[:, 0] - boxes_abs[:, 2] / 2
+            boxes_xyxy[:, 1] = boxes_abs[:, 1] - boxes_abs[:, 3] / 2
+            boxes_xyxy[:, 2] = boxes_abs[:, 0] + boxes_abs[:, 2] / 2
+            boxes_xyxy[:, 3] = boxes_abs[:, 1] + boxes_abs[:, 3] / 2
+            
+            # 2. SAM2 视频推理
+            # 大多数 SAM2 API 支持传入 list of numpy arrays 或者包含 jpeg 的目录路径
+            # 这里 SAM2 严格要求目录路径。我们建一个临时文件夹存放视频帧。
+            import tempfile
+            import os
+            temp_dir = tempfile.mkdtemp()
+            for _idx, _frame in enumerate(frames):
+                _frame.convert("RGB").save(os.path.join(temp_dir, f"{_idx:05d}.jpg"))
+            
+            np_frames = [np.array(f.convert("RGB")) for f in frames]
+            
+            # 初始化跟踪状态
+            inference_state = self.sam2_predictor.init_state(video_path=temp_dir)
+
+            
+            # 添加 第一帧的 box prompts
+            for obj_id, box in enumerate(boxes_xyxy, start=1):
+                self.sam2_predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=obj_id,
+                    box=box.cpu().numpy()
+                )
+            
+            # 前向传播追踪
+            video_segments = {}  # video_segments[out_frame_idx] = {out_obj_id: out_mask}
+            for out_frame_idx, out_obj_ids, out_mask_logits in self.sam2_predictor.propagate_in_video(inference_state):
+                video_segments[out_frame_idx] = {
+                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy().squeeze(0)
+                    for i, out_obj_id in enumerate(out_obj_ids)
+                }
+            
+            # 整理形状 (N_objects, T, H, W)
+            N_objs = len(boxes_xyxy)
+            T = len(frames)
+            video_masks_out = np.zeros((N_objs, T, H, W), dtype=bool)
+            
+            for t in range(T):
+                for obj_id in range(1, N_objs + 1):
+                    if obj_id in video_segments[t]:
+                        video_masks_out[obj_id - 1, t] = video_segments[t][obj_id]
+                        
+            batch_masks.append(torch.from_numpy(video_masks_out).to(self.device))
+            batch_boxes.append(boxes_xyxy)
+            
+            # 清理状态
+            self.sam2_predictor.reset_state(inference_state)
+            
+        return batch_masks, batch_boxes
+
+class OrientTeacher(nn.Module):
+    def __init__(self, 
+                 ckpt_path="../4D-Data/OriAnyV2_ckpt/rotmod_realrotaug_best.pt",
+                 device="cuda"):
+        super().__init__()
+        self.device = device
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        
+        model = VGGT_OriAny_Ref(out_dim=900, dtype=dtype, nopretrain=True)
+        if os.path.exists(ckpt_path):
+            model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
+        self.model = model.eval().to(device)
+        
+        for param in self.parameters():
+            param.requires_grad = False
+
+    @torch.no_grad()
+    def forward(self, frames_list, batch_masks, batch_boxes):
+        """
+        frames_list: Batch of List[PIL.Image] (T=16)
+        batch_masks: List of (N_objs, T, H, W) bool tensors
+        Returns:
+            batch_orients: List of shape (N_objects, T, 3) representing (az, el, ro)
+            batch_pose_tokens: List of shape (N_objects, T, 900) representing latent teacher features
+        """
+        batch_orients = []
+        batch_pose_tokens = []
+        
+        try:
+            from utils.app_utils import preprocess_images
+        except ImportError:
+            preprocess_images = None
+
+        for b_idx in range(len(frames_list)):
+            frames = frames_list[b_idx]
+            masks = batch_masks[b_idx] # (N_objects, T, H, W)
+            
+            N_objs = masks.shape[0]
+            T = len(frames)
+            orients = torch.zeros((N_objs, T, 3), device=self.device)
+            pose_tokens = torch.zeros((N_objs, T, 900), device=self.device)
+            
+            for obj_idx in range(N_objs):
+                roi_pil_list = []
+                valid_t_indices = []
+                
+                for t in range(T):
+                    frame_pil = frames[t].convert("RGB")
+                    mask_t = masks[obj_idx, t].cpu().numpy()
+                    
+                    if not np.any(mask_t):
+                        continue
+                        
+                    # 1. 用 SAM2 的 mask 将背景设为纯白
+                    frame_np = np.array(frame_pil)
+                    frame_np[~mask_t] = 255
+                    
+                    # 2. 扣出 ROI 区域
+                    y_indices, x_indices = np.where(mask_t)
+                    x_min, x_max = x_indices.min(), x_indices.max()
+                    y_min, y_max = y_indices.min(), y_indices.max()
+                    
+                    # 留一点 padding
+                    pad = 10
+                    H, W, _ = frame_np.shape
+                    x_min, x_max = max(0, x_min - pad), min(W, x_max + pad)
+                    y_min, y_max = max(0, y_min - pad), min(H, y_max + pad)
+                    
+                    roi_np = frame_np[y_min:y_max, x_min:x_max]
+                    roi_pil = Image.fromarray(roi_np)
+                    
+                    roi_pil_list.append(roi_pil)
+                    valid_t_indices.append(t)
+                    
+                if len(roi_pil_list) > 0 and preprocess_images is not None:
+                    # Batch process for inference
+                    try:
+                        # preprocess_images returns (S, 3, H, W) where S is number of images
+                        image_tensors = preprocess_images(roi_pil_list, mode="pad").to(self.device).to(self.model.dtype)
+                        # We need shape (B, S, C, H, W). We can treat B=S, S'=1, so each image is independent.
+                        batch_img_inputs = image_tensors.unsqueeze(1) # (S, 1, 3, H, W)
+                        
+                        # Forward pass
+                        pose_enc = self.model(batch_img_inputs) # (S, 1, 900)
+                        pose_enc = pose_enc.view(len(roi_pil_list), -1) # (S, 900)
+                        
+                        # Calculate angles
+                        angle_az_pred = torch.argmax(pose_enc[:, 0:360]       , dim=-1)
+                        angle_el_pred = torch.argmax(pose_enc[:, 360:360+180] , dim=-1) - 90
+                        angle_ro_pred = torch.argmax(pose_enc[:, 360+180:360+180+360] , dim=-1) - 180
+                        
+                        for i, t in enumerate(valid_t_indices):
+                            orients[obj_idx, t, 0] = angle_az_pred[i].item()
+                            orients[obj_idx, t, 1] = angle_el_pred[i].item()
+                            orients[obj_idx, t, 2] = angle_ro_pred[i].item()
+                            pose_tokens[obj_idx, t] = pose_enc[i]
+                            
+                    except Exception as e:
+                        print(f"Error in batch inference Orient V2: {e}")
+            
+            batch_orients.append(orients)
+            batch_pose_tokens.append(pose_tokens)
+            
+        return batch_orients, batch_pose_tokens
