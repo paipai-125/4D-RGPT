@@ -32,8 +32,7 @@ mv sam2.1_hiera_base_plus.pt ../../../4D-Data/sam2_weights
 cd ../..
 ```
 
-
-## 数据集准备 (Dataset Preparation)
+## 数据集准备
 
 ### 下载 SIMS-VSI 数据集 (HuggingFace)
 
@@ -47,7 +46,18 @@ tar --zstd -xvf video_shard_001.tar.zst
 tar --zstd -xvf video_shard_002.tar.zst
 ```
 
-## 运行训练 (Training)
+## 模型准备
+
+### 下载 bert-base-uncased 模型
+
+```bash
+cd 4D-RGPT/GroundingDINO
+huggingface-cli download google-bert/bert-base-uncased \
+  --repo-type model \
+  --local-dir bert-base-uncased
+```
+
+## 运行训练
 
 ```bash
 cd 4D-RGPT
