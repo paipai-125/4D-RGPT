@@ -469,7 +469,7 @@ def main():
 
     # Wrap Student with DDP
     if ddp_enabled:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
     # ==========================
     # 2. Initialize Teacher Models
@@ -506,10 +506,10 @@ def main():
     ori_decoder.train()
     
     if ddp_enabled:
-        d4dp = DDP(d4dp, device_ids=[local_rank])
-        cond_attn = DDP(cond_attn, device_ids=[local_rank])
-        seg_decoder = DDP(seg_decoder, device_ids=[local_rank])
-        ori_decoder = DDP(ori_decoder, device_ids=[local_rank])
+        d4dp = DDP(d4dp, device_ids=[local_rank], find_unused_parameters=True)
+        cond_attn = DDP(cond_attn, device_ids=[local_rank], find_unused_parameters=True)
+        seg_decoder = DDP(seg_decoder, device_ids=[local_rank], find_unused_parameters=True)
+        ori_decoder = DDP(ori_decoder, device_ids=[local_rank], find_unused_parameters=True)
     
     # ==========================
     # 4. Optimizer & Data
@@ -853,9 +853,22 @@ def main():
                     loss_ld = loss_components["loss_ld"].item() if isinstance(loss_components["loss_ld"], torch.Tensor) else loss_components["loss_ld"]
                     loss_ed = loss_components["loss_ed"].item() if isinstance(loss_components["loss_ed"], torch.Tensor) else loss_components["loss_ed"]
                     
-                    if seg_hiddens_extracted is not None and ori_hiddens_extracted is not None:
+                    # Ensure we ALWAYS invoke the decoders on every rank to participate in DDP graph
+                    dummy_used = False
+                    if seg_hiddens_extracted is None or ori_hiddens_extracted is None:
+                        if rank == 0:
+                            print("Warning: Using dummy forward to prevent DDP deadlock!")
+                        dummy_used = True
+                        dummy_seg = torch.zeros((1, num_frames, student_hidden_dim), device=device, requires_grad=True)
+                        dummy_ori = torch.zeros((1, num_frames, student_hidden_dim), device=device, requires_grad=True)
+                        
+                        pred_masks = seg_decoder(dummy_seg, student_visual_hidden, grid_thw, target_hw=(448, 448))
+                        pred_orients, pred_pose_tokens = ori_decoder(dummy_ori)
+                    else:
                         pred_masks = seg_decoder(seg_hiddens_extracted, student_visual_hidden, grid_thw, target_hw=(448, 448)) # (N, T, 448, 448)
                         pred_orients, pred_pose_tokens = ori_decoder(ori_hiddens_extracted) # (N, T, 6), (N, T, 900)
+                        
+                    if not dummy_used:
                         
                         # get the results as a tuple and manually unpack based on length
                         loss_res = compute_multi_teacher_loss(
@@ -888,6 +901,11 @@ def main():
                             'obj_mo': loss_components.get('loss_motion', torch.tensor(0.0)).item() if isinstance(loss_components.get('loss_motion', 0.0), torch.Tensor) else loss_components.get('loss_motion', 0.0)
                         }
                         dynamic_weights = weight_manager.step(task_stats)
+                        
+                        
+                        # Prevent hanging caused by conditional losses in DDP that skipped gradient calculation.
+                        # Some ranks might have produced 0.0 because of missing masks, but they skipped
+                        # DDP gradient tracking for parts of the network causing AllReduce to hang.
                         
                         # Apply dynamic weights
                         w_depth = dynamic_weights.get('obj_depth', 1.0)
@@ -922,6 +940,13 @@ def main():
                         loss_cons = loss_cons_geo + loss_cons_temp
                         
                         loss_distill = loss_l4p_weighted + loss_seg_distill + loss_ori_distill + loss_cons
+                    else:
+                        # Dummy is used, compute dummy loss to attach to graph
+                        loss_distill = loss_l4p + (pred_masks.sum() * 0.0) + (pred_orients.sum() * 0.0)
+                        loss_seg_distill = torch.tensor(0.0, device=device)
+                        loss_ori_distill = torch.tensor(0.0, device=device)
+                        loss_cons_geo = torch.tensor(0.0, device=device)
+                        loss_cons_temp = torch.tensor(0.0, device=device)
                         
                 except RuntimeError as e:
                     if rank == 0:
